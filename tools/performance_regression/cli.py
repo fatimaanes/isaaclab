@@ -89,7 +89,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
             print(f"::warning::perf-smoke: {exc}", file=sys.stderr)
 
     # An artifact is always written so that a faulted combination still shows in the summary.
-    report_mod.write_json(report, args.output_json)
+    report_mod.write_json(report.as_dict(), args.output_json)
     print(report_mod.render(report), end="")
     # Only a measured regression fails jobs; other errors are non-blocking and exit 0.
     return 1 if report.verdict == compare_mod.FAIL else 0

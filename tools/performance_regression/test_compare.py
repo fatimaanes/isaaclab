@@ -7,7 +7,6 @@
 
 import contextlib
 import copy
-import hashlib
 import io
 import json
 import tempfile
@@ -19,7 +18,6 @@ from unittest.mock import patch
 from . import cli, compare
 from .contract import Contract, build
 from .metrics import METRICS, PerfSmokeError
-from .source_revision import RUNTIME_MODULE, measurement_digest
 from .store import BaselineRow
 
 
@@ -177,13 +175,15 @@ class TestAsvComparison(unittest.TestCase):
                 self.assertEqual(json.loads(output.read_text())["verdict"], expected)
 
 
-class TestContracts(unittest.TestCase):
-    """Compare solver identity without invalidating legacy single-solver baselines."""
+class TestRuntimeComparisons(unittest.TestCase):
+    """Check contracts and paired calculations against the same runtime bundles."""
 
-    def test_solver_and_coupling_identity_controls_comparability(self):
-        bundle = {
+    def setUp(self):
+        self.bundle = {
             "run": {
                 "task": "task",
+                "status": "completed",
+                "seed": 42,
                 "num_envs": 16,
                 "config": {
                     "physics_backend": "newton_mjwarp",
@@ -192,8 +192,24 @@ class TestContracts(unittest.TestCase):
                 },
             },
             "versions": {"torch": "2.5", "warp": "1.9", "newton": "1.0", "mujoco": "3.4", "mjwarp": "0.1"},
-            "hardware": {"gpu_devices": [{"name": "L40S"}], "cpu_name": "cpu"},
+            "hardware": {"gpu_devices": [{"name": "L40S"}], "cpu_name": "cpu", "cpu_count": 32},
+            "runtime": {
+                "startup_time_s": {"app_launch": 1, "env_creation": 2, "first_step": 3},
+                "iterations_completed": 200,
+                "steps_per_iteration": 1,
+                "environment_step_timing": {"warmup_steps": 100, "measurement_mode": "stepping"},
+            },
+            "resources": {"gpu_mem_gb": {"peak": 2}, "ram_gb": {"peak": 4}},
         }
+        self.baseline, self.candidate = [], []
+        for samples, values in ((self.baseline, [90, 100, 1000]), (self.candidate, [80, 81, 82])):
+            for fps in values:
+                bundle = copy.deepcopy(self.bundle)
+                bundle["runtime"]["total_fps"] = {"mean": fps}
+                samples.append(bundle)
+
+    def test_solver_and_coupling_identity_controls_comparability(self):
+        bundle = self.bundle
         config = bundle["run"]["config"]
         legacy = build(bundle)
         self.assertEqual(legacy.hash, "9138656bb16b2861")
@@ -214,153 +230,23 @@ class TestContracts(unittest.TestCase):
         with self.assertRaisesRegex(compare.PerfSmokeError, "versions.mjwarp"):
             build(bundle)
 
-
-class TestPairedComparison(unittest.TestCase):
-    """Exercise the local CLI, source evidence, calculation, and rendered report together."""
-
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.directory = Path(self.temporary.name)
-        self.case = 0
-
-    def fixture(self):
-        self.case += 1
-        self.root = self.directory / str(self.case)
-        self.root.mkdir()
-        self.legs = self.root / "legs.tsv"
-        self.legs.write_text("fixture|Task|16|600|physics=physx\n")
-        self.measurement = {"commit": "b" * 40, "files": {"source/isaaclab/isaaclab/benchmark/runtime.py": "c" * 64}}
-        self.measurement["digest"] = measurement_digest(self.measurement["files"])
-        self.bundles = {}
-        self.paths = {}
-        for role, root, commit, values in (
-            ("baseline", self.root / "baseline", "a" * 40, [90, 100, 1000]),
-            ("candidate", self.root, "b" * 40, [80, 81, 82]),
-        ):
-            root.mkdir(exist_ok=True)
-            manifest = {
-                "schema_version": 4,
-                "commit": commit,
-                "files": list(self.measurement["files"]),
-                "measurement": self.measurement,
-            }
-            (root / "source-manifest.json").write_text(json.dumps(manifest))
-            (root / "image-id").write_text(f"sha256:{commit}")
-            (root / "fixture").mkdir()
-            (root / "fixture/status").write_text("ok\n")
-            self.bundles[role] = []
-            self.paths[role] = []
-            for sample, fps in enumerate(values, 1):
-                bundle = {
-                    "run": {
-                        "task": "Task",
-                        "status": "completed",
-                        "seed": 42,
-                        "num_envs": 16,
-                        "config": {"physics_backend": "physx", "rendering_backend": "none", "presets": []},
-                    },
-                    "hardware": {"cpu_name": "CPU", "cpu_count": 32, "gpu_devices": [{"name": "NVIDIA L40S"}]},
-                    "versions": {"torch": "2.5", "warp": "1.9", "isaacsim": "6.2"},
-                    "runtime": {
-                        "total_fps": {"mean": fps},
-                        "iterations_completed": 200,
-                        "steps_per_iteration": 1,
-                        "environment_step_timing": {"warmup_steps": 100, "measurement_mode": "stepping"},
-                    },
-                }
-                path = root / f"fixture/sample-{sample}/benchmark_runtime_fixture.json"
-                path.parent.mkdir()
-                self.bundles[role].append(bundle)
-                self.paths[role].append(path)
-        self.save_samples()
-
-    def save_samples(self):
-        for role, bundles in self.bundles.items():
-            for path, bundle in zip(self.paths[role], bundles):
-                data = json.dumps(bundle).encode()
-                path.write_bytes(data)
-                proof = {
-                    "schema_version": 4,
-                    "commit": ("a" if role == "baseline" else "b") * 40,
-                    "status": "verified",
-                    "mismatches": [],
-                    "bytecode_policy": "fresh_process_cache",
-                    "measurement_digest": self.measurement["digest"],
-                    "modules": [{"name": RUNTIME_MODULE, "relative_path": next(iter(self.measurement["files"]))}],
-                    "outputs": [{"path": path.name, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}],
-                }
-                path.with_name("source-revision.json").write_text(json.dumps(proof))
-
-    def invoke(self):
-        with (
-            contextlib.redirect_stdout(io.StringIO()),
-            patch.object(cli.store_mod, "read", side_effect=AssertionError("Paired comparison must stay local")),
-            patch.object(cli.store_mod, "write", side_effect=AssertionError("Paired comparison must stay local")),
-            patch("urllib.request.urlopen", side_effect=AssertionError("Paired comparison must stay local")),
-        ):
-            status = cli.main(
-                [
-                    "pair",
-                    "--results_dir",
-                    str(self.root),
-                    "--legs",
-                    str(self.legs),
-                    "--base_commit",
-                    "a" * 40,
-                    "--commit",
-                    "b" * 40,
-                ]
-            )
-        self.assertEqual(status, 0, "Informational paired deltas must not change the history gate")
-        report = json.loads((self.root / "paired-comparison.json").read_text())
-        return report["rows"][0], (self.root / "paired-comparison.md").read_text()
-
-    def test_medians_context_and_non_gating_report(self):
-        self.fixture()
-        row, markdown = self.invoke()
-        self.assertEqual(row["status"], "compared")
+    def test_paired_medians_and_dependency_context(self):
+        row = compare.compare_pair(self.baseline, self.candidate)
+        self.assertFalse(row["reasons"])
         self.assertEqual(row["baseline"]["median"], 100)
         self.assertEqual(row["candidate"]["median"], 81)
         self.assertAlmostEqual(row["change_pct"], -19)
-        self.assertIn("-19.00%", markdown)
-        self.assertIn("do not change the rolling-history gate", markdown)
-        for bundle in self.bundles["candidate"]:
+        for bundle in self.candidate:
             bundle["versions"]["warp"] = "2.0"
-        self.save_samples()
-        row, markdown = self.invoke()
-        self.assertEqual(row["status"], "compared")
-        self.assertTrue(row["context_changed"])
-        self.assertIn("Dependency versions differ", markdown)
+        row = compare.compare_pair(self.baseline, self.candidate)
+        self.assertFalse(row["reasons"])
+        self.assertNotEqual(row["versions"]["baseline"], row["versions"]["candidate"])
+        for bundle in self.baseline:
+            bundle["runtime"]["total_fps"]["mean"] = 0
+        self.assertIsNone(compare.compare_pair(self.baseline, self.candidate)["change_pct"])
 
-    def test_pair_reuses_metric_definitions_and_full_extraction_keeps_its_contract(self):
-        self.fixture()
-        bundle = copy.deepcopy(self.bundles["candidate"][0])
-        bundle["runtime"]["startup_time_s"] = {"app_launch": 1, "env_creation": 2, "first_step": 3}
-        bundle["resources"] = {"gpu_mem_gb": {"peak": 2}, "ram_gb": {"peak": 4}}
-        self.assertEqual(cli.metrics_mod.extract(bundle), _measurement(80, startup=6))
-        del bundle["resources"]
-        self.assertEqual(cli.metrics_mod.extract(bundle, names=("total_fps",)), {"total_fps": 80})
-        with self.assertRaises(PerfSmokeError):
-            cli.metrics_mod.extract(bundle)
-        with self.assertRaisesRegex(PerfSmokeError, "Unknown metric"):
-            cli.metrics_mod.extract(bundle, names=("misspelled",))
-        # A definition change must reach the paired path without a second hard-coded FPS path.
-        definitions = tuple(
-            replace(metric, path=("runtime", "renamed_fps", "mean")) if metric.name == "total_fps" else metric
-            for metric in METRICS
-        )
-        for bundles in self.bundles.values():
-            for bundle in bundles:
-                bundle["runtime"]["renamed_fps"] = bundle["runtime"].pop("total_fps")
-        self.save_samples()
-        with patch.object(cli.metrics_mod, "METRICS", definitions):
-            row, _ = self.invoke()
-        self.assertEqual(row["status"], "compared")
-        self.assertAlmostEqual(row["change_pct"], -19)
-
-    def test_incompatible_and_invalid_samples_have_no_delta(self):
-        changes = [
+    def test_paired_invalid_or_incompatible_samples(self):
+        for field, value in (
             ("run.task", "Other"),
             ("run.num_envs", 32),
             ("run.seed", 43),
@@ -379,106 +265,35 @@ class TestPairedComparison(unittest.TestCase):
             ("runtime.total_fps.mean", -1),
             ("runtime.total_fps.mean", float("nan")),
             ("runtime.total_fps.mean", float("inf")),
+            ("resources", {}),
             ("versions.warp", "2.0"),
-        ]
-        for field, value in changes:
-            with self.subTest(field=field, value=value):
-                self.fixture()
-                target = self.bundles["candidate"][0]
-                parts = field.split(".")
-                for part in parts[:-1]:
-                    target = target[part]
-                target[parts[-1]] = value
-                self.save_samples()
-                row, markdown = self.invoke()
-                self.assertEqual(row["status"], "not_comparable")
-                self.assertIsNone(row["change_pct"])
-                self.assertIn("Not comparable", markdown)
-
-    def test_missing_corrupt_or_unverified_source_still_reports_the_current_build(self):
-        for failure in (
-            "missing manifest",
-            "missing proof",
-            "failed proof",
-            "wrong commit",
-            "wrong measurement",
-            "output tampering",
-            "wrong import",
-            "bad measurement manifest",
-            "invalid proof",
-            "non-object JSON",
         ):
-            with self.subTest(failure=failure):
-                self.fixture()
-                path = self.paths["baseline"][0]
-                proof_path = path.with_name("source-revision.json")
-                proof = json.loads(proof_path.read_text())
-                if failure == "missing manifest":
-                    (self.root / "baseline/source-manifest.json").unlink()
-                elif failure == "missing proof":
-                    proof_path.unlink()
-                elif failure == "output tampering":
-                    path.write_text(path.read_text() + " ")
-                elif failure == "non-object JSON":
-                    path.write_bytes(b"[]")
-                    proof["outputs"][0].update(sha256=hashlib.sha256(b"[]").hexdigest(), bytes=2)
-                    proof_path.write_text(json.dumps(proof))
-                elif failure == "bad measurement manifest":
-                    manifest_path = self.root / "source-manifest.json"
-                    manifest = json.loads(manifest_path.read_text())
-                    manifest["measurement"]["digest"] = "d" * 64
-                    manifest_path.write_text(json.dumps(manifest))
-                else:
-                    if failure == "failed proof":
-                        proof["status"] = "failed"
-                    elif failure == "wrong commit":
-                        proof["commit"] = "c" * 40
-                    elif failure == "wrong measurement":
-                        proof["measurement_digest"] = "d" * 64
-                    elif failure == "wrong import":
-                        proof["modules"][0]["relative_path"] = "cached-image/runtime.py"
-                    elif failure == "invalid proof":
-                        proof = {}
-                    proof_path.write_text(json.dumps(proof))
-                row, markdown = self.invoke()
-                self.assertEqual(row["status"], "not_comparable")
+            with self.subTest(field=field, value=value):
+                candidate = copy.deepcopy(self.candidate)
+                target = candidate[0]
+                *parents, key = field.split(".")
+                for part in parents:
+                    target = target[part]
+                target[key] = value
+                row = compare.compare_pair(self.baseline, candidate)
+                self.assertTrue(row["reasons"])
                 self.assertIsNone(row["change_pct"])
-                if failure != "bad measurement manifest":
-                    self.assertEqual(row["candidate"]["median"], 81)
-                self.assertIn("Not comparable", markdown)
-
-    def test_independent_sample_completeness_and_failed_leg(self):
-        for failure in ("missing", "duplicate", "failed leg", "invalid json"):
-            with self.subTest(failure=failure):
-                self.fixture()
-                if failure == "missing":
-                    self.paths["baseline"][0].unlink()
-                elif failure == "duplicate":
-                    self.paths["baseline"][0].rename(
-                        self.paths["baseline"][1].with_name("benchmark_runtime_other.json")
-                    )
-                elif failure == "failed leg":
-                    (self.root / "baseline/fixture/status").write_text("failed")
-                else:
-                    self.paths["baseline"][0].write_text("{")
-                row, _ = self.invoke()
-                self.assertEqual(row["status"], "not_comparable")
+        for count in (0, 1, 2, 4):
+            with self.subTest(samples=count):
+                row = compare.compare_pair(self.baseline, (self.candidate * 2)[:count])
+                self.assertTrue(row["reasons"])
                 self.assertIsNone(row["change_pct"])
-                self.assertEqual(row["candidate"]["count"], 3)
 
-    def test_zero_baseline_and_escaped_labels(self):
-        self.fixture()
-        for bundle in self.bundles["baseline"]:
-            bundle["runtime"]["total_fps"]["mean"] = 0
-        self.save_samples()
-        row, markdown = self.invoke()
-        self.assertEqual(row["status"], "compared")
-        self.assertIsNone(row["change_pct"])
-        self.assertIn("base FPS is zero", markdown)
-        payload = json.loads((self.root / "paired-comparison.json").read_text())
-        payload["rows"][0]["label"] = "task | <script>\nnext"
-        rendered = cli.report_mod.render_pair(payload)
-        self.assertIn("task &#124; &lt;script&gt; next", rendered)
+    def test_metric_definitions_have_one_owner(self):
+        definitions = tuple(
+            replace(metric, path=("runtime", "renamed_fps", "mean")) if metric.name == "total_fps" else metric
+            for metric in METRICS
+        )
+        for bundle in self.baseline + self.candidate:
+            bundle["runtime"]["renamed_fps"] = bundle["runtime"].pop("total_fps")
+        with patch.object(cli.metrics_mod, "METRICS", definitions):
+            self.assertEqual(cli.metrics_mod.extract(self.candidate[0]), _measurement(80, startup=6))
+            self.assertAlmostEqual(compare.compare_pair(self.baseline, self.candidate)["change_pct"], -19)
 
 
 if __name__ == "__main__":

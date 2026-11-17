@@ -60,7 +60,7 @@ def compare_pair(baseline: list[dict], candidate: list[dict], *, issues: list[st
                 run, runtime = bundle["run"], mapping(bundle.get("runtime"), "runtime")
                 if run.get("status") != "completed":
                     raise PerfSmokeError("runtime sample did not complete")
-                fps = extract(bundle, names=("total_fps",))["total_fps"]
+                fps = extract(bundle)["total_fps"]
                 timing = mapping(runtime.get("environment_step_timing"), "environment_step_timing")
                 protocol = {
                     "seed": run.get("seed"),
@@ -92,11 +92,7 @@ def compare_pair(baseline: list[dict], candidate: list[dict], *, issues: list[st
         if versions and any(value != versions[0] for value in versions[1:]):
             reasons.append(f"{role}: dependency versions vary between samples.")
         contexts[role] = versions[0] if versions else {}
-        selections[role] = {
-            "samples": values,
-            "count": len(values),
-            "median": statistics.median(values) if values else None,
-        }
+        selections[role] = {"samples": values, "median": statistics.median(values) if values else None}
     if identities:
         for field in ("workload", "hardware", "protocol"):
             if any(identity[field] != identities[0][field] for identity in identities[1:]):
@@ -111,11 +107,9 @@ def compare_pair(baseline: list[dict], candidate: list[dict], *, issues: list[st
                 reasons.append(str(exc))
     return {
         **selections,
-        "status": "not_comparable" if reasons else "compared",
         "change_pct": change,
         "reasons": list(dict.fromkeys(reasons)),
         "versions": contexts,
-        "context_changed": contexts["baseline"] != contexts["candidate"],
     }
 
 

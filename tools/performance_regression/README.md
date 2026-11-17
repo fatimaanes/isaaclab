@@ -9,8 +9,9 @@ The base is the tested merge commit's first parent, verified against the request
 PR head. Both sides use the PR's saved benchmark package and timer implementation,
 with each revision's own dependency image. Source manifests, imported-module checks,
 and output hashes bind each sample to the selected checkout and measurement code.
-Three independent completed samples, matching workload/hardware/protocol, and valid
-source evidence are required before a percentage is shown. FPS is the sample median;
+Three independent completed bundles, matching workload/hardware/protocol, and valid
+source evidence are required before a percentage is shown. Bundles use the existing
+full-metric validation contract. FPS is the sample median;
 positive change means higher FPS. A zero baseline has no percentage change.
 
 These are descriptive build comparisons, not significance tests or isolated commit
@@ -31,25 +32,19 @@ the four-workload matrix has up to 744 minutes of paired attempts, so PR jobs al
 ## Ownership
 
 Keep execution state in `.github/workflows/build.yaml`: it resolves revisions,
-prepares images, preserves the measurement implementation outside checkout cleanup,
-and passes explicit paths to the existing launcher. `source_revision.py` owns source
-verification and the measurement snapshot; `run_benchmarks.sh` prepares each role's
-source manifest once and owns the container lifecycle. The workflow passes the
-selected commit and output directory rather than preparing the runner's state.
-`cli.py` reads local inputs and writes results; `contract.py` normalizes workload
-identity; `compare.py` calculates; `report.py` renders and writes both report shapes.
-
-Use `metrics.extract` with selected names for paired FPS and its default full metric
-set for history. Metric paths and numeric validation have one owner in `METRICS` and
-its extractor. Use `report.write_json` for both paired and history report JSON. Source
-proofs are checked before their exact bytes are decoded as runtime data. The existing
-package-install retry helper handles transient dependency-install failures.
+prepares images, and preserves PR measurement code outside checkout cleanup.
+`run_benchmarks.sh` prepares each role's manifest once and owns containers;
+`source_revision.py` owns snapshots and source evidence, verifying exact output bytes
+before decoding them. `cli.py` handles local files, `contract.py` normalizes identity,
+`compare.py` calculates, and `report.py` renders and serializes plain dictionaries.
+Both comparisons use `metrics.extract` without paired-only metric selectors.
 
 Do not add a second paired controller, remote artifact-selection subsystem, network
 access to paired calculations/rendering, or tests inside production modules. Keep
 history storage in `store.py` and preserve the existing exception, threshold path,
-and check names. Extend the existing comparison, source, and workflow tests when
-changing these boundaries.
+and check names. Extend the real source-verification fixture for paired CLI coverage;
+do not construct a second fake source-proof fixture. Test calculations with the
+existing runtime-contract cases and avoid storing derived status/count flags.
 
 ## Validation
 

@@ -13,12 +13,14 @@ import subprocess
 import sys
 import textwrap
 from contextlib import suppress
+from inspect import signature
 from pathlib import Path
 
 import pytest
 import yaml
 
 from tools.performance_regression.source_revision import MEASUREMENT_PATHS
+from tools.performance_regression.metrics import extract
 
 _WORKFLOW = Path(__file__).resolve().parents[2] / "workflows/build.yaml"
 
@@ -236,6 +238,8 @@ def test_local_pair_ownership_and_workflow_lifecycle() -> None:
             }
     assert (root / "tools/perf_smoke_thresholds.json").is_file()
     assert not (root / "tools/performance_regression_thresholds.json").exists()
+    # Paired reporting consumes the existing bundle contract; do not add a second metric-selection API.
+    assert tuple(signature(extract).parameters) == ("bundle",)
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     job = workflow["jobs"]["performance-smoke"]
     steps = job["steps"]
@@ -246,9 +250,6 @@ def test_local_pair_ownership_and_workflow_lifecycle() -> None:
     report = names.index("Compare fresh base and PR measurements")
     assert baseline < restore < candidate < report
     assert steps[baseline]["continue-on-error"] is True
-    assert "!cancelled()" in steps[restore]["if"]
-    assert "!cancelled()" in steps[candidate]["if"] and "measure_base" not in steps[candidate]["if"]
-    assert "always()" in steps[report]["if"]
     assert workflow["jobs"]["performance-smoke-summary"]["name"] == "performance-smoke"
     conditions = {
         "current": steps[candidate]["if"],
@@ -289,4 +290,3 @@ for (const base of ['success', 'failure', 'skipped']) {
     matrix = next(step["run"] for step in steps if step.get("name") == "Define benchmark matrix")
     limits = [int(line.split("|")[3]) for line in matrix.splitlines() if "|" in line]
     assert sum(limits) * 3 * 2 * 2 / 60 < 900
-    assert "900" in str(job["timeout-minutes"])

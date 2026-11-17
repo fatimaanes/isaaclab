@@ -8,7 +8,7 @@ set -uo pipefail
 
 : "${CHECKOUT_ROOT:?}" "${BENCHMARK_OUTPUT:?}" "${SOURCE_REVISION_LAUNCHER:?}"
 : "${BENCHMARK_COMMIT:?}" "${BENCHMARK_LEGS:?}" "${CI_IMAGE_TAG:?}" "${JIT_CACHE_ROOT:?}"
-: "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+: "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}" "${BENCHMARK_ROLE:?}"
 
 SOURCE_MANIFEST="$BENCHMARK_OUTPUT/source-manifest.json"
 measurement_args=()
@@ -48,7 +48,7 @@ run_attempt() {
       -v "$PERF_MEASUREMENT_ROOT/source/isaaclab/isaaclab/utils/timer.py:/workspace/isaaclab/source/isaaclab/isaaclab/utils/timer.py:ro"
     )
   fi
-  container="performance-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${BENCHMARK_ROLE:-CURRENT}-${leg}-${sample}-${attempt}"
+  container="performance-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${BENCHMARK_ROLE}-${leg}-${sample}-${attempt}"
   cleanup_container
   python3 "$SOURCE_REVISION_LAUNCHER" check --checkout-root "$CHECKOUT_ROOT" \
     --manifest "$SOURCE_MANIFEST" --output-dir "${BENCHMARK_OUTPUT}/${leg}/sample-${sample}" || return 1

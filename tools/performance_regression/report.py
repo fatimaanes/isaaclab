@@ -37,12 +37,12 @@ def render_pair(report: dict) -> str:
     ]
     for row in report["rows"]:
         notes = list(row["reasons"])
-        if row["context_changed"]:
+        if row["versions"]["baseline"] != row["versions"]["candidate"]:
             notes.append("Dependency versions differ; this comparison does not isolate a commit effect.")
-        if row["status"] == "compared" and row["baseline"]["median"] == 0:
+        if not row["reasons"] and row["baseline"]["median"] == 0:
             notes.append("Percentage change is undefined because base FPS is zero.")
-        notes.append(f"Samples base/PR: {row['baseline']['count']}/3, {row['candidate']['count']}/3.")
-        if row["status"] != "compared":
+        notes.append(f"Samples base/PR: {len(row['baseline']['samples'])}/3, {len(row['candidate']['samples'])}/3.")
+        if row["reasons"]:
             notes.insert(0, "Not comparable.")
         cells = [
             row["label"],
@@ -162,8 +162,7 @@ def render_aggregate(reports: list[tuple[str, Report]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_json(report: Report | dict, path: Path) -> None:
+def write_json(report: dict, path: Path) -> None:
     """Write the machine-readable comparison to ``path``. The Markdown form goes to stdout."""
-    payload = report.as_dict() if isinstance(report, Report) else report
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")

@@ -13,6 +13,7 @@ import io
 import json
 import subprocess
 import sys
+import tarfile
 import tempfile
 import traceback
 from pathlib import Path, PurePosixPath
@@ -25,8 +26,8 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _git(root: Path, *args: str, data: bytes | None = None) -> bytes:
-    result = subprocess.run(["git", "-C", str(root), *args], input=data, capture_output=True, check=False)
+def _git(root: Path, *args: str) -> bytes:
+    result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, check=False)
     if result.returncode:
         raise ValueError(f"Git source inspection failed: {result.stderr.decode(errors='replace').strip()}")
     return result.stdout
@@ -53,24 +54,15 @@ def resolve_base(root: Path, expected_commit: str, expected_head: str) -> str:
 def snapshot_measurement(root: Path, output_dir: Path) -> dict:
     """Save the tested revision's measurement package for both benchmark legs."""
     commit = _git(root, "rev-parse", "HEAD").decode().strip()
-    entries = {}
-    for entry in _git(root, "ls-tree", "-rz", "--full-tree", commit, "--", *MEASUREMENT_PATHS).split(b"\0")[:-1]:
-        metadata, path_bytes = entry.split(b"\t", 1)
-        _, kind, oid = metadata.decode().split()
-        if kind == "blob":
-            entries[path_bytes.decode()] = oid
-    if not entries:
-        raise ValueError("The selected PR contains no measurement implementation.")
-    batch = io.BytesIO(_git(root, "cat-file", "--batch", data="".join(f"{oid}\n" for oid in entries.values()).encode()))
     files = {}
-    for path in entries:
-        _, _, size = batch.readline().split()
-        blob = batch.read(int(size))
-        batch.read(1)
-        destination = output_dir / path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(blob)
-        files[path] = _digest(blob)
+    with tarfile.open(fileobj=io.BytesIO(_git(root, "archive", commit, *MEASUREMENT_PATHS))) as archive:
+        for member in archive:
+            if member.isfile():
+                blob = archive.extractfile(member).read()
+                destination = output_dir / member.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(blob)
+                files[member.name] = _digest(blob)
     manifest = {"schema_version": 1, "commit": commit, "files": files, "digest": measurement_digest(files)}
     (output_dir / "measurement-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return manifest
@@ -131,13 +123,9 @@ def prepare_manifest(
         "namespaces": {name: sorted(paths) for name, paths in sorted(namespaces.items())},
     }
     if measurement_manifest is not None:
-        try:
-            if not isinstance(measurement_manifest["files"], dict):
-                raise TypeError("Measurement files must map paths to hashes.")
-            if measurement_digest(measurement_manifest["files"]) != measurement_manifest["digest"]:
-                raise ValueError("Measurement manifest digest does not match its files.")
-        except (KeyError, TypeError) as exc:
-            raise ValueError(f"Invalid measurement manifest: {exc}") from exc
+        files = measurement_manifest["files"]
+        if not isinstance(files, dict) or not files or measurement_digest(files) != measurement_manifest["digest"]:
+            raise ValueError("Measurement manifest must map source paths to hashes matching its digest.")
         manifest["measurement"] = measurement_manifest
     return manifest
 
@@ -159,13 +147,13 @@ def read_verified_result(manifest: dict, proof: dict, path: Path, expected_commi
         or proof.get("measurement_digest") != measurement["digest"]
     ):
         raise ValueError("Source proof is missing, failed, or identifies another checkout/measurement.")
-    modules = proof.get("modules", [])
+    modules = proof["modules"]
     allowed = set(manifest["files"]) | measurement["files"].keys()
     if not any(module.get("name") == RUNTIME_MODULE for module in modules) or any(
         module.get("relative_path") not in allowed for module in modules
     ):
         raise ValueError("Imported benchmark source does not match the source manifest.")
-    outputs = [item for item in proof.get("outputs", []) if item.get("path") == path.name]
+    outputs = [item for item in proof["outputs"] if item.get("path") == path.name]
     data = path.read_bytes()
     if len(outputs) != 1 or outputs[0].get("sha256") != _digest(data) or outputs[0].get("bytes") != len(data):
         raise ValueError("Runtime result bytes do not match their verified source proof.")
@@ -173,19 +161,6 @@ def read_verified_result(manifest: dict, proof: dict, path: Path, expected_commi
     if not isinstance(result, dict):
         raise ValueError("Runtime sample must be a JSON object.")
     return result
-
-
-def _inspect_files(files: dict, root: Path) -> list[dict]:
-    mismatches = []
-    for relative, expected in files.items():
-        try:
-            if _digest((root / relative).read_bytes()) != expected:
-                mismatches.append(
-                    {"path": relative, "reason": "Measurement source differs from the selected manifest."}
-                )
-        except OSError as exc:
-            mismatches.append({"path": relative, "reason": f"Measurement source could not be read: {exc.strerror}."})
-    return mismatches
 
 
 def _inspect_modules(manifest: dict, root: Path) -> tuple[list[dict], list[dict]]:
@@ -251,7 +226,14 @@ def run_benchmark(manifest: dict, root: Path, output_dir: Path, argv: list[str])
         if measurement is not None:
             if measurement_digest(measurement["files"]) != measurement["digest"]:
                 mismatches.append({"reason": "Measurement manifest digest does not match its files."})
-            mismatches.extend(_inspect_files(measurement["files"], root))
+            for relative, expected in measurement["files"].items():
+                try:
+                    if _digest((root / relative).read_bytes()) == expected:
+                        continue
+                    reason = "Measurement source differs from the selected manifest."
+                except OSError as exc:
+                    reason = f"Measurement source could not be read: {exc.strerror}."
+                mismatches.append({"path": relative, "reason": reason})
         outputs = []
         for path, state in sorted(_output_state(output_dir).items()):
             if before.get(path) == state:

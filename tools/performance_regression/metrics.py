@@ -122,27 +122,20 @@ def total_startup_time_s(bundle: dict[str, Any]) -> float:
     return number(sum(values), "total startup time")
 
 
-def extract(bundle: dict[str, Any], *, names: tuple[str, ...] | None = None) -> dict[str, float]:
-    """Extract selected metrics using the shared definitions and validation.
+def extract(bundle: dict[str, Any]) -> dict[str, float]:
+    """Extract every metric in :data:`METRICS` from a runtime bundle.
 
     Args:
         bundle: A schema-v1 runtime bundle.
-        names: Metric names to extract, or ``None`` for every metric in :data:`METRICS`.
-            Unselected advisory metrics need not be present in the bundle.
 
     Returns:
         Mapping of metric name to measured value.
 
     Raises:
-        PerfSmokeError: If a requested name is unknown or a selected metric is missing, non-numeric, or negative.
+        PerfSmokeError: If any metric is missing, non-numeric, or negative.
     """
-    unknown = set(names or ()) - {metric.name for metric in METRICS}
-    if unknown:
-        raise PerfSmokeError(f"Unknown metric names: {sorted(unknown)}")
     values: dict[str, float] = {}
     for metric in METRICS:
-        if names is not None and metric.name not in names:
-            continue
         if metric.path is None:
             values[metric.name] = total_startup_time_s(bundle)
             continue
