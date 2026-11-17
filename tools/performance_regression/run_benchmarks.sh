@@ -7,13 +7,20 @@
 set -uo pipefail
 
 : "${CHECKOUT_ROOT:?}" "${BENCHMARK_OUTPUT:?}" "${SOURCE_REVISION_LAUNCHER:?}"
-: "${SOURCE_MANIFEST:?}" "${BENCHMARK_LEGS:?}" "${CI_IMAGE_TAG:?}" "${JIT_CACHE_ROOT:?}"
+: "${BENCHMARK_COMMIT:?}" "${BENCHMARK_LEGS:?}" "${CI_IMAGE_TAG:?}" "${JIT_CACHE_ROOT:?}"
 : "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+
+SOURCE_MANIFEST="$BENCHMARK_OUTPUT/source-manifest.json"
+measurement_args=()
+if [ -n "${PERF_MEASUREMENT_ROOT:-}" ]; then
+  measurement_args=(--measurement-manifest "$PERF_MEASUREMENT_ROOT/measurement-manifest.json")
+fi
+python3 "$SOURCE_REVISION_LAUNCHER" prepare --checkout-root "$CHECKOUT_ROOT" --commit "$BENCHMARK_COMMIT" \
+  --output "$SOURCE_MANIFEST" "${measurement_args[@]}" || exit 1
 
 install -d -m 0777 "${JIT_CACHE_ROOT}/warp" "${JIT_CACHE_ROOT}/nv"
 # Make restored cache files and folders writable inside Docker.
 chmod -R a+rwX "${JIT_CACHE_ROOT}" || exit 1
-mkdir -p "$BENCHMARK_OUTPUT"
 docker image inspect --format '{{.Id}}' "$CI_IMAGE_TAG" > "$BENCHMARK_OUTPUT/image-id" || true
 
 container=""

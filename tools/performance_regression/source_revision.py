@@ -142,8 +142,8 @@ def prepare_manifest(
     return manifest
 
 
-def verify_result(manifest: dict, proof: dict, path: Path, expected_commit: str, measurement: dict) -> None:
-    """Validate a local sample's source evidence and bind it to its exact output bytes."""
+def read_verified_result(manifest: dict, proof: dict, path: Path, expected_commit: str, measurement: dict) -> dict:
+    """Read runtime data only after its source evidence and exact output bytes are verified."""
     if manifest.get("schema_version") != 4 or not expected_commit or manifest.get("commit") != expected_commit:
         raise ValueError("Source manifest does not identify the intended checkout.")
     if not measurement.get("files") or measurement_digest(measurement["files"]) != measurement.get("digest"):
@@ -169,6 +169,10 @@ def verify_result(manifest: dict, proof: dict, path: Path, expected_commit: str,
     data = path.read_bytes()
     if len(outputs) != 1 or outputs[0].get("sha256") != _digest(data) or outputs[0].get("bytes") != len(data):
         raise ValueError("Runtime result bytes do not match their verified source proof.")
+    result = json.loads(data)
+    if not isinstance(result, dict):
+        raise ValueError("Runtime sample must be a JSON object.")
+    return result
 
 
 def _inspect_files(files: dict, root: Path) -> list[dict]:

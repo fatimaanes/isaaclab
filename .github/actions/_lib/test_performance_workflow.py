@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tools.performance_regression.source_revision import MEASUREMENT_PATHS
+
 _WORKFLOW = Path(__file__).resolve().parents[2] / "workflows/build.yaml"
 
 
@@ -105,7 +107,14 @@ def test_benchmark_cancellation(tmp_path: Path, role: str) -> None:
     (scripts / "run_benchmarks.sh").write_bytes(
         (_WORKFLOW.parents[2] / "tools/performance_regression/run_benchmarks.sh").read_bytes()
     )
-    (scripts / "source_revision.py").write_text("", encoding="utf-8")
+    (scripts / "source_revision.py").write_text(
+        "import json, os, sys\nfrom pathlib import Path\n"
+        "with (Path(os.environ['GITHUB_WORKSPACE']) / 'source-calls').open('a') as stream:\n"
+        "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1] == 'prepare':\n"
+        "    Path(sys.argv[sys.argv.index('--output') + 1]).parent.mkdir(parents=True, exist_ok=True)\n",
+        encoding="utf-8",
+    )
     (controller / "benchmark-legs.tsv").write_text("fixture|Fixture-Task|1|600|\n", encoding="utf-8")
     executables = tmp_path / "bin"
     executables.mkdir()
@@ -142,9 +151,6 @@ def test_benchmark_cancellation(tmp_path: Path, role: str) -> None:
         '#!/bin/bash\nprintf "%s" "$1" > "$GITHUB_WORKSPACE/attempt-limit"\nshift\nexec "$@"\n', encoding="utf-8"
     )
     timeout.chmod(0o755)
-    df = executables / "df"
-    df.write_text('#!/bin/bash\nprintf "Filesystem 1B-blocks\\nshm 1073741824\\n"\n', encoding="utf-8")
-    df.chmod(0o755)
     environment = {
         **os.environ,
         "PATH": f"{executables}{os.pathsep}{os.environ['PATH']}",
@@ -155,14 +161,16 @@ def test_benchmark_cancellation(tmp_path: Path, role: str) -> None:
         "GITHUB_RUN_ATTEMPT": "2",
         "CI_IMAGE_TAG": "fixture-image",
         "PERF_BASE_COMMIT": "a" * 40,
+        "GITHUB_SHA": "b" * 40,
     }
     expected_mounts = {
         f"{tmp_path}/{path}:/workspace/isaaclab/{path}:{mode}"
         for path, mode in (("source", "rw"), ("scripts", "ro"), ("apps", "ro"))
     }
-    for path in ("source/isaaclab/isaaclab/benchmark", "source/isaaclab/isaaclab/utils/timer.py"):
+    for path in MEASUREMENT_PATHS:
         expected_mounts.add(f"{controller}/measurement/{path}:/workspace/isaaclab/{path}:ro")
     for stop_signal in (signal.SIGINT, signal.SIGTERM):
+        (tmp_path / "source-calls").unlink(missing_ok=True)
         process = subprocess.Popen(
             ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", str(step_script)],
             cwd=tmp_path,
@@ -177,6 +185,14 @@ def test_benchmark_cancellation(tmp_path: Path, role: str) -> None:
             assert started is not None, (stop_signal.name, process.stderr.read())
             docker_args = started["argv"][: started["argv"].index(environment["CI_IMAGE_TAG"])]
             assert (tmp_path / "attempt-limit").read_text() == "600"
+            calls = [json.loads(line) for line in (tmp_path / "source-calls").read_text().splitlines()]
+            prepared = [call for call in calls if call[0] == "prepare"]
+            assert len(prepared) == 1
+            args = prepared[0]
+            assert args[args.index("--commit") + 1] == ("a" if role == "baseline" else "b") * 40
+            assert args[args.index("--measurement-manifest") + 1] == str(
+                controller / "measurement/measurement-manifest.json"
+            )
             mounts = {docker_args[index + 1] for index, arg in enumerate(docker_args) if arg == "-v"}
             assert expected_mounts <= mounts, (
                 f"Missing or incorrect Docker source mounts: {sorted(expected_mounts - mounts)};"
@@ -249,21 +265,18 @@ def test_local_pair_ownership_and_workflow_lifecycle() -> None:
 const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const assert = require('assert/strict');
 for (const base of ['success', 'failure', 'skipped']) {
-  for (const source of ['success', 'failure']) {
     for (const cancelled of [false, true]) {
-      const steps = {base_dependencies: {outcome: base}, measure_base: {outcome: base},
-                     current_source: {outcome: source}};
+      const steps = {base_dependencies: {outcome: base}, measure_base: {outcome: base}};
       const github = {event_name: 'pull_request'};
       const evaluate = name => new Function('steps', 'github', 'cancelled', 'always',
         'return (' + input[name] + ')')(steps, github, () => cancelled, () => true);
-      assert.equal(evaluate('current'), !cancelled && source === 'success');
+      assert.equal(evaluate('current'), !cancelled);
       assert.equal(evaluate('restore'), !cancelled);
       assert.equal(evaluate('report'), true);
       assert.equal(evaluate('budget'), 900);
       github.event_name = 'push';
       assert.equal(evaluate('budget'), 450);
     }
-  }
 }
 """,
         ],

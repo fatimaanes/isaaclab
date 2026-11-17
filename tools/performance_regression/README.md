@@ -33,9 +33,17 @@ the four-workload matrix has up to 744 minutes of paired attempts, so PR jobs al
 Keep execution state in `.github/workflows/build.yaml`: it resolves revisions,
 prepares images, preserves the measurement implementation outside checkout cleanup,
 and passes explicit paths to the existing launcher. `source_revision.py` owns source
-verification and the measurement snapshot; `run_benchmarks.sh` owns the container
-lifecycle. `cli.py` reads local inputs and writes results; `contract.py` normalizes
-workload identity; `compare.py` calculates; `report.py` renders.
+verification and the measurement snapshot; `run_benchmarks.sh` prepares each role's
+source manifest once and owns the container lifecycle. The workflow passes the
+selected commit and output directory rather than preparing the runner's state.
+`cli.py` reads local inputs and writes results; `contract.py` normalizes workload
+identity; `compare.py` calculates; `report.py` renders and writes both report shapes.
+
+Use `metrics.extract` with selected names for paired FPS and its default full metric
+set for history. Metric paths and numeric validation have one owner in `METRICS` and
+its extractor. Use `report.write_json` for both paired and history report JSON. Source
+proofs are checked before their exact bytes are decoded as runtime data. The existing
+package-install retry helper handles transient dependency-install failures.
 
 Do not add a second paired controller, remote artifact-selection subsystem, network
 access to paired calculations/rendering, or tests inside production modules. Keep

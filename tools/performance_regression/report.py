@@ -162,7 +162,8 @@ def render_aggregate(reports: list[tuple[str, Report]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_json(report: Report, path: Path) -> None:
+def write_json(report: Report | dict, path: Path) -> None:
     """Write the machine-readable comparison to ``path``. The Markdown form goes to stdout."""
+    payload = report.as_dict() if isinstance(report, Report) else report
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report.as_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")

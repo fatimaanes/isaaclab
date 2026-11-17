@@ -6,11 +6,13 @@
 """Host-only integration tests exercising the real ASV comparison engine."""
 
 import contextlib
+import copy
 import hashlib
 import io
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -331,6 +333,32 @@ class TestPairedComparison(unittest.TestCase):
         self.assertTrue(row["context_changed"])
         self.assertIn("Dependency versions differ", markdown)
 
+    def test_pair_reuses_metric_definitions_and_full_extraction_keeps_its_contract(self):
+        self.fixture()
+        bundle = copy.deepcopy(self.bundles["candidate"][0])
+        bundle["runtime"]["startup_time_s"] = {"app_launch": 1, "env_creation": 2, "first_step": 3}
+        bundle["resources"] = {"gpu_mem_gb": {"peak": 2}, "ram_gb": {"peak": 4}}
+        self.assertEqual(cli.metrics_mod.extract(bundle), _measurement(80, startup=6))
+        del bundle["resources"]
+        self.assertEqual(cli.metrics_mod.extract(bundle, names=("total_fps",)), {"total_fps": 80})
+        with self.assertRaises(PerfSmokeError):
+            cli.metrics_mod.extract(bundle)
+        with self.assertRaisesRegex(PerfSmokeError, "Unknown metric"):
+            cli.metrics_mod.extract(bundle, names=("misspelled",))
+        # A definition change must reach the paired path without a second hard-coded FPS path.
+        definitions = tuple(
+            replace(metric, path=("runtime", "renamed_fps", "mean")) if metric.name == "total_fps" else metric
+            for metric in METRICS
+        )
+        for bundles in self.bundles.values():
+            for bundle in bundles:
+                bundle["runtime"]["renamed_fps"] = bundle["runtime"].pop("total_fps")
+        self.save_samples()
+        with patch.object(cli.metrics_mod, "METRICS", definitions):
+            row, _ = self.invoke()
+        self.assertEqual(row["status"], "compared")
+        self.assertAlmostEqual(row["change_pct"], -19)
+
     def test_incompatible_and_invalid_samples_have_no_delta(self):
         changes = [
             ("run.task", "Other"),
@@ -378,6 +406,7 @@ class TestPairedComparison(unittest.TestCase):
             "wrong import",
             "bad measurement manifest",
             "invalid proof",
+            "non-object JSON",
         ):
             with self.subTest(failure=failure):
                 self.fixture()
@@ -390,6 +419,10 @@ class TestPairedComparison(unittest.TestCase):
                     proof_path.unlink()
                 elif failure == "output tampering":
                     path.write_text(path.read_text() + " ")
+                elif failure == "non-object JSON":
+                    path.write_bytes(b"[]")
+                    proof["outputs"][0].update(sha256=hashlib.sha256(b"[]").hexdigest(), bytes=2)
+                    proof_path.write_text(json.dumps(proof))
                 elif failure == "bad measurement manifest":
                     manifest_path = self.root / "source-manifest.json"
                     manifest = json.loads(manifest_path.read_text())

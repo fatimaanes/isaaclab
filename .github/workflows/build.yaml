@@ -1111,13 +1111,9 @@ jobs:
         CI_IMAGE_TAG: isaac-lab-perf-base:${{ needs.config.outputs.paired_base_commit }}
       run: |
         set -euo pipefail
-        python3 "$PERF_CONTROLLER/tools/performance_regression/source_revision.py" prepare \
-          --checkout-root "$GITHUB_WORKSPACE" --commit "$PERF_BASE_COMMIT" \
-          --measurement-manifest "$PERF_MEASUREMENT_ROOT/measurement-manifest.json" \
-          --output "$PERF_CONTROLLER/baseline-output/source-manifest.json"
         CHECKOUT_ROOT="$GITHUB_WORKSPACE" BENCHMARK_OUTPUT="$PERF_CONTROLLER/baseline-output" \
         SOURCE_REVISION_LAUNCHER="$PERF_CONTROLLER/tools/performance_regression/source_revision.py" \
-        SOURCE_MANIFEST="$PERF_CONTROLLER/baseline-output/source-manifest.json" \
+        BENCHMARK_COMMIT="$PERF_BASE_COMMIT" \
         BENCHMARK_LEGS="$PERF_CONTROLLER/benchmark-legs.tsv" JIT_CACHE_ROOT="$PERF_CONTROLLER/jit-cache" \
         BENCHMARK_ROLE=BASELINE exec bash "$PERF_CONTROLLER/tools/performance_regression/run_benchmarks.sh"
 
@@ -1140,27 +1136,14 @@ jobs:
         cache-tag: cache-base
         pull-on-deps-hit: 'true'
 
-    - name: Prepare benchmark source revision evidence
-      id: current_source
-      if: ${{ !cancelled() }}
-      run: |
-        set -euo pipefail
-        measurement_args=()
-        if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-          measurement_args=(--measurement-manifest "$PERF_MEASUREMENT_ROOT/measurement-manifest.json")
-        fi
-        python3 "$PERF_CONTROLLER/tools/performance_regression/source_revision.py" prepare \
-          --checkout-root "$GITHUB_WORKSPACE" --commit "$GITHUB_SHA" "${measurement_args[@]}" \
-          --output "$GITHUB_WORKSPACE/benchmark-output/source-manifest.json"
-
     - name: Run runtime benchmarks
-      if: ${{ !cancelled() && steps.current_source.outcome == 'success' }}
+      if: ${{ !cancelled() }}
       env:
         CI_IMAGE_TAG: ${{ needs.config.outputs.ci_image_tag }}
       run: |
         CHECKOUT_ROOT="$GITHUB_WORKSPACE" BENCHMARK_OUTPUT="$GITHUB_WORKSPACE/benchmark-output" \
         SOURCE_REVISION_LAUNCHER="$PERF_CONTROLLER/tools/performance_regression/source_revision.py" \
-        SOURCE_MANIFEST="$GITHUB_WORKSPACE/benchmark-output/source-manifest.json" \
+        BENCHMARK_COMMIT="$GITHUB_SHA" \
         BENCHMARK_LEGS="$PERF_CONTROLLER/benchmark-legs.tsv" JIT_CACHE_ROOT="$PERF_CONTROLLER/jit-cache" \
         BENCHMARK_ROLE=PR exec bash "$PERF_CONTROLLER/tools/performance_regression/run_benchmarks.sh"
 
@@ -1201,7 +1184,7 @@ jobs:
         set -euo pipefail
         venv="${RUNNER_TEMP}/perf-smoke-venv"
         uv venv --python 3.12 "$venv"
-        uv pip install --python "$venv/bin/python" \
+        bash .github/actions/_lib/with-python-package-retries.sh uv pip install --python "$venv/bin/python" \
           -r tools/performance_regression/requirements.txt
         echo "python=$venv/bin/python" >> "$GITHUB_OUTPUT"
 

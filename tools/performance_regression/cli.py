@@ -145,21 +145,20 @@ def _cmd_pair(args: argparse.Namespace) -> int:
                 if sorted(path.parent.name for path in paths) != ["sample-1", "sample-2", "sample-3"]:
                     issues.append(f"{role}: expected one result from each independent sample directory.")
                 for path in paths:
-                    sample = _load_json(path, "runtime sample")
                     proof = _load_json(path.with_name("source-revision.json"), "source proof")
-                    source_revision.verify_result(manifest, proof, path, commit, measurement)
-                    samples[role].append(sample)
+                    samples[role].append(
+                        source_revision.read_verified_result(manifest, proof, path, commit, measurement)
+                    )
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 issues.append(f"{role}: {exc}")
         row = compare_mod.compare_pair(samples["baseline"], samples["candidate"], issues=issues)
         report["rows"].append({"label": leg, **row})
     output = args.results_dir / "paired-comparison"
-    args.results_dir.mkdir(parents=True, exist_ok=True)
     report["images"] = {}
     for role, root in (("baseline", args.results_dir / "baseline"), ("candidate", args.results_dir)):
         path = root / "image-id"
         report["images"][role] = path.read_text().strip() if path.exists() else "unavailable"
-    output.with_suffix(".json").write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
+    report_mod.write_json(report, output.with_suffix(".json"))
     output.with_suffix(".md").write_text(report_mod.render_pair(report), encoding="utf-8")
     return 0
 

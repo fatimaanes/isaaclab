@@ -20,7 +20,7 @@ from math import comb
 from typing import Any
 
 from .contract import Contract, backend_key, build, normalize_gpu_model, valid_backend_keys
-from .metrics import METRICS, Metric, PerfSmokeError, mapping, nested_number, number, positive_int
+from .metrics import METRICS, Metric, PerfSmokeError, extract, mapping, number, positive_int
 
 PASS = "PASS"
 WARN = "WARN"
@@ -60,9 +60,7 @@ def compare_pair(baseline: list[dict], candidate: list[dict], *, issues: list[st
                 run, runtime = bundle["run"], mapping(bundle.get("runtime"), "runtime")
                 if run.get("status") != "completed":
                     raise PerfSmokeError("runtime sample did not complete")
-                fps = nested_number(bundle, ("runtime", "total_fps", "mean"))
-                if fps is None or fps < 0:
-                    raise PerfSmokeError("FPS must be finite and nonnegative")
+                fps = extract(bundle, names=("total_fps",))["total_fps"]
                 timing = mapping(runtime.get("environment_step_timing"), "environment_step_timing")
                 protocol = {
                     "seed": run.get("seed"),
