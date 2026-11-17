@@ -17,6 +17,9 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from . import cli, source_revision
 
 LAUNCHER = Path(__file__).with_name("source_revision.py")
 TASK = Path("source/isaaclab_tasks/isaaclab_tasks/fixture_task.py")
@@ -71,7 +74,14 @@ class SourceRevisionTests(unittest.TestCase):
                 output.mkdir(parents=True, exist_ok=True)
                 result = {
                     "executed_revision": marker,
-                    "runtime": {"total_fps": {"mean": FPS}},
+                    "run": {"task": "Task", "status": "completed", "seed": 42, "num_envs": 16,
+                            "config": {"physics_backend": "physx", "rendering_backend": "none", "presets": []}},
+                    "hardware": {"cpu_name": "CPU", "cpu_count": 32, "gpu_devices": [{"name": "L40S"}]},
+                    "versions": {"torch": "2.5", "warp": "1.9", "isaacsim": "6.2"},
+                    "runtime": {"total_fps": {"mean": FPS}, "iterations_completed": 200, "steps_per_iteration": 1,
+                                "startup_time_s": {"app_launch": 1, "env_creation": 2, "first_step": 3},
+                                "environment_step_timing": {"warmup_steps": 100, "measurement_mode": "stepping"}},
+                    "resources": {"gpu_mem_gb": {"peak": 2}, "ram_gb": {"peak": 4}},
                 }
                 (output / "benchmark_runtime_fixture.json").write_text(json.dumps(result))
             """,
@@ -177,6 +187,7 @@ class SourceRevisionTests(unittest.TestCase):
         return result
 
     def test_source_verification_workflow(self):
+        self.assertEqual(source_revision.prepare_manifest(self.checkout, self.commit_a)["commit"], self.commit_a)
         manifest_a, _ = self._prepare("manifest-a", "--commit", self.commit_a)
         with self.subTest(case="cached package origin is rejected"):
             output, sidecar = self._run(manifest_a, "stale", success=False, roots=[self.cached, self.checkout])
@@ -263,15 +274,76 @@ class SourceRevisionTests(unittest.TestCase):
             commit_b = self._commit()
             measurement = self._snapshot()
             expected = json.loads(measurement.read_text())
-            for marker, commit in (("A", self.commit_a), ("B", commit_b)):
+            results = self.directory / "paired"
+            for marker, commit, root in (("A", self.commit_a, results / "baseline"), ("B", commit_b, results)):
                 with self.subTest(workload=marker):
                     self._git("checkout", "--force", "--detach", commit)
                     manifest, _ = self._prepare(f"manifest-{marker}", measurement=measurement)
                     self._overlay(measurement)
-                    output, proof = self._run(manifest, f"result-{marker}", roots=[self.checkout, self.cached])
-                    result = self._assert_verified(output, proof, marker, commit)
-                    self.assertEqual(result["runtime"]["total_fps"]["mean"], 300.0)
-                    self.assertEqual(proof["measurement_digest"], expected["digest"])
+                    root.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(manifest, root / "source-manifest.json")
+                    (root / "image-id").write_text(f"image-{marker}")
+                    for sample in range(1, 4):
+                        output, proof = self._run(manifest, root / f"fixture/sample-{sample}")
+                        result = self._assert_verified(output, proof, marker, commit)
+                        self.assertEqual(result["runtime"]["total_fps"]["mean"], 300.0)
+                        self.assertEqual(proof["measurement_digest"], expected["digest"])
+                    (root / "fixture/status").write_text("ok")
+            manifest = json.loads(manifest.read_text())
+            path = output / "benchmark_runtime_fixture.json"
+            self.assertEqual(source_revision.read_verified_result(manifest, proof, path, commit_b, expected), result)
+            for changes in (
+                {"schema_version": 0},
+                {"status": "failed"},
+                {"commit": self.commit_a},
+                {"mismatches": [{}]},
+                {"bytecode_policy": "stale"},
+                {"measurement_digest": "bad"},
+                {"outputs": []},
+                {"modules": [{"name": RUNTIME_MODULE, "relative_path": "cached-image/runtime.py"}]},
+            ):
+                with self.subTest(proof=changes), self.assertRaises(ValueError):
+                    source_revision.read_verified_result(manifest, proof | changes, path, commit_b, expected)
+            original = path.read_bytes()
+            for data in (b"[]", b"{"):
+                path.write_bytes(data)
+                digest = hashlib.sha256(data).hexdigest()
+                changed = {"outputs": [{"path": path.name, "sha256": digest, "bytes": len(data)}]}
+                with self.subTest(data=data), self.assertRaises(ValueError):
+                    source_revision.read_verified_result(manifest, proof | changed, path, commit_b, expected)
+            path.write_bytes(original)
+            legs = self.directory / "legs.tsv"
+            legs.write_text("fixture|Task|16|600|physics=physx\n")
+            argv = ["pair", "--results_dir", str(results), "--legs", str(legs)]
+            argv += ["--base_commit", self.commit_a, "--commit", commit_b]
+            for changed_path, replacement in (
+                (None, None),
+                (results / "baseline/source-manifest.json", None),
+                (results / "baseline/fixture/sample-1/source-revision.json", b"{}"),
+                (results / "baseline/fixture/sample-1/benchmark_runtime_fixture.json", b"[]"),
+                (results / "baseline/fixture/sample-1/benchmark_runtime_fixture.json", None),
+                (results / "baseline/fixture/status", b"failed"),
+            ):
+                with self.subTest(input=changed_path, replacement=replacement):
+                    if changed_path:
+                        original = changed_path.read_bytes()
+                        changed_path.unlink() if replacement is None else changed_path.write_bytes(replacement)
+                    with (
+                        patch("urllib.request.urlopen", side_effect=AssertionError("Paired reporting stays local")),
+                        patch.object(cli.store_mod, "read", side_effect=AssertionError("No paired store reads")),
+                        patch.object(cli.store_mod, "write", side_effect=AssertionError("No paired store writes")),
+                    ):
+                        self.assertEqual(cli.main(argv), 0)
+                    row = json.loads((results / "paired-comparison.json").read_text())["rows"][0]
+                    self.assertEqual(bool(row["reasons"]), bool(changed_path))
+                    self.assertEqual(row["change_pct"], None if changed_path else 0)
+                    self.assertEqual(row["candidate"]["median"], 300)
+                    if changed_path:
+                        changed_path.write_bytes(original)
+            report = json.loads((results / "paired-comparison.json").read_text())
+            report["rows"][0]["label"] = "task | <script>\nnext"
+            self.assertIn("task &#124; &lt;script&gt; next", cli.report_mod.render_pair(report))
+            self.assertIn("do not change the rolling-history gate", (results / "paired-comparison.md").read_text())
             self._task("C")
             self._commit()
             later = json.loads(self._snapshot("later-measurement").read_text())
@@ -287,6 +359,36 @@ class SourceRevisionTests(unittest.TestCase):
             _, proof = self._run(manifest, "fresh-bytecode", success=False)
             self.assertEqual(proof["outputs"], [])
             self.assertTrue(any("produced no runtime JSON output" in item["reason"] for item in proof["mismatches"]))
+
+    def test_resolve_actual_merge_parent_in_a_shallow_checkout(self):
+        self._git("checkout", "--quiet", "-b", "pr")
+        self._task("B")
+        head = self._commit()
+        self._git("checkout", "--quiet", "-b", "base", self.commit_a)
+        self._write("base.txt", "Base moved after the PR event was created.\n")
+        base = self._commit()
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            "Fixture merge",
+            head,
+        )
+        merge = self._git("rev-parse", "HEAD")
+        # A depth-one checkout still contains the parent headers in the commit object.
+        (self.checkout / ".git/shallow").write_text(merge + "\n")
+        result = self._invoke("resolve-base", "--commit", merge, "--head-commit", head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), base)
+        for tested, requested in ((base, head), (merge, self.commit_a)):
+            with self.subTest(tested=tested, requested=requested):
+                result = self._invoke("resolve-base", "--commit", tested, "--head-commit", requested)
+                self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

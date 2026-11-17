@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Performance regression gate: compare a PR's runtime benchmark against the default branch's history.
+"""Performance smoke gate: compare a PR's runtime benchmark against the default branch's history.
 
 * :mod:`metrics`  -- the runtime bundle's shape
 * :mod:`contract` -- which runs are comparable
@@ -13,6 +13,6 @@
 * :mod:`cli`      -- wiring
 """
 
-from .metrics import METRICS, Metric, PerformanceRegressionError
+from .metrics import METRICS, Metric, PerfSmokeError
 
-__all__ = ["METRICS", "Metric", "PerformanceRegressionError"]
+__all__ = ["METRICS", "Metric", "PerfSmokeError"]

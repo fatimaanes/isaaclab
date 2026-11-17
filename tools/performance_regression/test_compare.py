@@ -6,16 +6,18 @@
 """Host-only integration tests exercising the real ASV comparison engine."""
 
 import contextlib
+import copy
 import io
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from . import cli, compare
 from .contract import Contract, build
-from .metrics import METRICS, PerformanceRegressionError
+from .metrics import METRICS, PerfSmokeError
 from .store import BaselineRow
 
 
@@ -43,7 +45,8 @@ class TestAsvComparison(unittest.TestCase):
         )
 
     def test_relative_regressions_and_improvement(self):
-        # Three baseline samples exercise the CI fallback; twenty permit Mann–Whitney testing.
+        # Three baseline samples exercise the CI fallback; twenty permit ASV's
+        # Mann–Whitney test. FPS equality also checks the threshold factor.
         for count in (3, 20):
             for fps, expected in (
                 (100, compare.PASS),
@@ -157,7 +160,7 @@ class TestAsvComparison(unittest.TestCase):
                     patch.object(cli.contract_mod, "build", return_value=self.contract),
                     patch.object(cli.metrics_mod, "extract", return_value=_measurement(80)),
                     patch.object(cli.store_mod, "is_configured", return_value=configured),
-                    patch.object(cli.store_mod, "read", side_effect=PerformanceRegressionError("unavailable")),
+                    patch.object(cli.store_mod, "read", side_effect=PerfSmokeError("unavailable")),
                 ):
                     status = cli.main(
                         [
@@ -172,13 +175,15 @@ class TestAsvComparison(unittest.TestCase):
                 self.assertEqual(json.loads(output.read_text())["verdict"], expected)
 
 
-class TestContracts(unittest.TestCase):
-    """Compare solver identity without invalidating legacy single-solver baselines."""
+class TestRuntimeComparisons(unittest.TestCase):
+    """Check contracts and paired calculations against the same runtime bundles."""
 
-    def test_solver_and_coupling_identity_controls_comparability(self):
-        bundle = {
+    def setUp(self):
+        self.bundle = {
             "run": {
                 "task": "task",
+                "status": "completed",
+                "seed": 42,
                 "num_envs": 16,
                 "config": {
                     "physics_backend": "newton_mjwarp",
@@ -187,8 +192,24 @@ class TestContracts(unittest.TestCase):
                 },
             },
             "versions": {"torch": "2.5", "warp": "1.9", "newton": "1.0", "mujoco": "3.4", "mjwarp": "0.1"},
-            "hardware": {"gpu_devices": [{"name": "L40S"}], "cpu_name": "cpu"},
+            "hardware": {"gpu_devices": [{"name": "L40S"}], "cpu_name": "cpu", "cpu_count": 32},
+            "runtime": {
+                "startup_time_s": {"app_launch": 1, "env_creation": 2, "first_step": 3},
+                "iterations_completed": 200,
+                "steps_per_iteration": 1,
+                "environment_step_timing": {"warmup_steps": 100, "measurement_mode": "stepping"},
+            },
+            "resources": {"gpu_mem_gb": {"peak": 2}, "ram_gb": {"peak": 4}},
         }
+        self.baseline, self.candidate = [], []
+        for samples, values in ((self.baseline, [90, 100, 1000]), (self.candidate, [80, 81, 82])):
+            for fps in values:
+                bundle = copy.deepcopy(self.bundle)
+                bundle["runtime"]["total_fps"] = {"mean": fps}
+                samples.append(bundle)
+
+    def test_solver_and_coupling_identity_controls_comparability(self):
+        bundle = self.bundle
         config = bundle["run"]["config"]
         legacy = build(bundle)
         self.assertEqual(legacy.hash, "9138656bb16b2861")
@@ -206,8 +227,73 @@ class TestContracts(unittest.TestCase):
         config["physics_backend"] = "newton_kamino"
         config["physics_solvers"] = ["newton_kamino", "newton_mjwarp"]
         del bundle["versions"]["mjwarp"]
-        with self.assertRaisesRegex(compare.PerformanceRegressionError, "versions.mjwarp"):
+        with self.assertRaisesRegex(compare.PerfSmokeError, "versions.mjwarp"):
             build(bundle)
+
+    def test_paired_medians_and_dependency_context(self):
+        row = compare.compare_pair(self.baseline, self.candidate)
+        self.assertFalse(row["reasons"])
+        self.assertEqual(row["baseline"]["median"], 100)
+        self.assertEqual(row["candidate"]["median"], 81)
+        self.assertAlmostEqual(row["change_pct"], -19)
+        for bundle in self.candidate:
+            bundle["versions"]["warp"] = "2.0"
+        row = compare.compare_pair(self.baseline, self.candidate)
+        self.assertFalse(row["reasons"])
+        self.assertNotEqual(row["versions"]["baseline"], row["versions"]["candidate"])
+        for bundle in self.baseline:
+            bundle["runtime"]["total_fps"]["mean"] = 0
+        self.assertIsNone(compare.compare_pair(self.baseline, self.candidate)["change_pct"])
+
+    def test_paired_invalid_or_incompatible_samples(self):
+        for field, value in (
+            ("run.task", "Other"),
+            ("run.num_envs", 32),
+            ("run.seed", 43),
+            ("run.status", "failed"),
+            ("run.config.presets", ["other"]),
+            ("hardware.cpu_name", "Other CPU"),
+            ("hardware.cpu_name", "unknown"),
+            ("hardware.cpu_count", 64),
+            ("hardware.gpu_devices", [{"name": "A100"}]),
+            ("hardware.gpu_devices", [{"name": "unknown"}]),
+            ("runtime.iterations_completed", 201),
+            ("runtime.steps_per_iteration", 2),
+            ("runtime.environment_step_timing.warmup_steps", 99),
+            ("runtime.environment_step_timing.measurement_mode", None),
+            ("runtime.total_fps.mean", True),
+            ("runtime.total_fps.mean", -1),
+            ("runtime.total_fps.mean", float("nan")),
+            ("runtime.total_fps.mean", float("inf")),
+            ("resources", {}),
+            ("versions.warp", "2.0"),
+        ):
+            with self.subTest(field=field, value=value):
+                candidate = copy.deepcopy(self.candidate)
+                target = candidate[0]
+                *parents, key = field.split(".")
+                for part in parents:
+                    target = target[part]
+                target[key] = value
+                row = compare.compare_pair(self.baseline, candidate)
+                self.assertTrue(row["reasons"])
+                self.assertIsNone(row["change_pct"])
+        for count in (0, 1, 2, 4):
+            with self.subTest(samples=count):
+                row = compare.compare_pair(self.baseline, (self.candidate * 2)[:count])
+                self.assertTrue(row["reasons"])
+                self.assertIsNone(row["change_pct"])
+
+    def test_metric_definitions_have_one_owner(self):
+        definitions = tuple(
+            replace(metric, path=("runtime", "renamed_fps", "mean")) if metric.name == "total_fps" else metric
+            for metric in METRICS
+        )
+        for bundle in self.baseline + self.candidate:
+            bundle["runtime"]["renamed_fps"] = bundle["runtime"].pop("total_fps")
+        with patch.object(cli.metrics_mod, "METRICS", definitions):
+            self.assertEqual(cli.metrics_mod.extract(self.candidate[0]), _measurement(80, startup=6))
+            self.assertAlmostEqual(compare.compare_pair(self.baseline, self.candidate)["change_pct"], -19)
 
 
 if __name__ == "__main__":
