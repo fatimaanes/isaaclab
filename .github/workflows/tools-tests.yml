@@ -11,10 +11,10 @@ on:
     paths:
       # The repo-root conftest.py writes the crash journal these tests read back.
       - "conftest.py"
-      # Tool subpackages have separate test workflows.
+      # Tools subpackages run their own checks.
       - "tools/*.py"
       - "tools/performance_regression/**"
-      - "tools/performance_regression_thresholds.json"
+      - "tools/perf_smoke_thresholds.json"
       # Shared CI action helpers and their co-located tests.
       - ".github/actions/_lib/**"
       - ".github/actions/ecr-build-push-pull/**"
@@ -33,7 +33,7 @@ jobs:
   tools-tests:
     name: Tools tests
     runs-on: ubuntu-latest
-    # Stop the job if a crash-test subprocess hangs.
+    # Bound stalled crash-test subprocesses.
     timeout-minutes: 10
 
     steps:
@@ -43,7 +43,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          # Use this workflow's dependency list as the cache key.
+          # Separate this job's pip cache by its dependency list.
           cache-dependency-path: .github/workflows/tools-tests.yml
 
       # These tests run without Isaac Sim; flaky and pytest-xdist enable retry and parallel crash tests.
@@ -63,6 +63,5 @@ jobs:
         with:
           enable-cache: false
 
-      - name: Test performance comparisons
-        run: uv run --no-project --with-requirements tools/performance_regression/requirements.txt --with pytest
-          python -m pytest tools/performance_regression/test_compare.py tools/performance_regression/test_source_revision.py tools/performance_regression/pr_comparison.py -v --noconftest
+      - name: Test ASV performance comparisons
+        run: uv run --no-project --with-requirements tools/performance_regression/requirements.txt python -m unittest tools.performance_regression.test_compare tools.performance_regression.test_source_revision

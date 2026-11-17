@@ -32,25 +32,35 @@ def _git(root: Path, *args: str, data: bytes | None = None) -> bytes:
     return result.stdout
 
 
-def _tracked_files(root: Path, commit: str, paths: tuple[str, ...]) -> dict[str, str]:
-    files = {}
-    for entry in _git(root, "ls-tree", "-rz", "--full-tree", commit, "--", *paths).split(b"\0")[:-1]:
-        metadata, path_bytes = entry.split(b"\t", 1)
-        _, kind, oid = metadata.decode().split()
-        if kind == "blob":
-            files[path_bytes.decode()] = oid
-    return files
-
-
 def measurement_digest(files: dict[str, str]) -> str:
     """Identify measurement contents independently of the commit containing them."""
     return _digest(json.dumps(files, sort_keys=True, separators=(",", ":")).encode())
 
 
+def resolve_base(root: Path, expected_commit: str, expected_head: str) -> str:
+    """Return the tested merge's first parent, rather than a possibly stale event base."""
+    commit = _git(root, "rev-parse", "HEAD").decode().strip()
+    parents = [
+        line.split()[1]
+        for line in _git(root, "cat-file", "-p", commit).decode().split("\n\n", 1)[0].splitlines()
+        if line.startswith("parent ")
+    ]
+    if commit != expected_commit or len(parents) != 2 or parents[1] != expected_head:
+        raise ValueError("The checkout is not the expected PR merge with the requested head as its second parent.")
+    return parents[0]
+
+
 def snapshot_measurement(root: Path, output_dir: Path) -> dict:
     """Save the tested revision's measurement package for both benchmark legs."""
     commit = _git(root, "rev-parse", "HEAD").decode().strip()
-    entries = _tracked_files(root, commit, MEASUREMENT_PATHS)
+    entries = {}
+    for entry in _git(root, "ls-tree", "-rz", "--full-tree", commit, "--", *MEASUREMENT_PATHS).split(b"\0")[:-1]:
+        metadata, path_bytes = entry.split(b"\t", 1)
+        _, kind, oid = metadata.decode().split()
+        if kind == "blob":
+            entries[path_bytes.decode()] = oid
+    if not entries:
+        raise ValueError("The selected PR contains no measurement implementation.")
     batch = io.BytesIO(_git(root, "cat-file", "--batch", data="".join(f"{oid}\n" for oid in entries.values()).encode()))
     files = {}
     for path in entries:
@@ -94,7 +104,7 @@ def check_checkout(root: Path, expected_commit: str | None = None) -> str:
 
 
 def prepare_manifest(
-    root: Path, measurement_manifest: dict | None = None, *, expected_commit: str | None = None
+    root: Path, expected_commit: str | None = None, *, measurement_manifest: dict | None = None
 ) -> dict:
     """Record the selected commit and repository-relative Python paths.
     `files` lists paths. `namespaces` maps installed package names to their source directories.
@@ -130,6 +140,35 @@ def prepare_manifest(
             raise ValueError(f"Invalid measurement manifest: {exc}") from exc
         manifest["measurement"] = measurement_manifest
     return manifest
+
+
+def verify_result(manifest: dict, proof: dict, path: Path, expected_commit: str, measurement: dict) -> None:
+    """Validate a local sample's source evidence and bind it to its exact output bytes."""
+    if manifest.get("schema_version") != 4 or not expected_commit or manifest.get("commit") != expected_commit:
+        raise ValueError("Source manifest does not identify the intended checkout.")
+    if not measurement.get("files") or measurement_digest(measurement["files"]) != measurement.get("digest"):
+        raise ValueError("Shared measurement manifest is missing or invalid.")
+    if manifest.get("measurement") != measurement:
+        raise ValueError("The sample does not use the shared PR measurement implementation.")
+    if (
+        proof.get("schema_version") != 4
+        or proof.get("status") != "verified"
+        or proof.get("mismatches") != []
+        or proof.get("commit") != expected_commit
+        or proof.get("bytecode_policy") != "fresh_process_cache"
+        or proof.get("measurement_digest") != measurement["digest"]
+    ):
+        raise ValueError("Source proof is missing, failed, or identifies another checkout/measurement.")
+    modules = proof.get("modules", [])
+    allowed = set(manifest["files"]) | measurement["files"].keys()
+    if not any(module.get("name") == RUNTIME_MODULE for module in modules) or any(
+        module.get("relative_path") not in allowed for module in modules
+    ):
+        raise ValueError("Imported benchmark source does not match the source manifest.")
+    outputs = [item for item in proof.get("outputs", []) if item.get("path") == path.name]
+    data = path.read_bytes()
+    if len(outputs) != 1 or outputs[0].get("sha256") != _digest(data) or outputs[0].get("bytes") != len(data):
+        raise ValueError("Runtime result bytes do not match their verified source proof.")
 
 
 def _inspect_files(files: dict, root: Path) -> list[dict]:
@@ -247,6 +286,10 @@ def main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--output", type=Path, required=True)
     prepare.add_argument("--commit")
     prepare.add_argument("--measurement-manifest", type=Path)
+    resolve = commands.add_parser("resolve-base")
+    resolve.add_argument("--checkout-root", type=Path, required=True)
+    resolve.add_argument("--commit", required=True)
+    resolve.add_argument("--head-commit", required=True)
     check = commands.add_parser("check")
     check.add_argument("--manifest", type=Path, required=True)
     check.add_argument("--checkout-root", type=Path, required=True)
@@ -261,13 +304,16 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("benchmark_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     try:
+        if args.command == "resolve-base":
+            print(resolve_base(args.checkout_root, args.commit, args.head_commit))
+            return 0
         if args.command == "snapshot":
             manifest = snapshot_measurement(args.checkout_root, args.output_dir)
             print(f"Prepared measurement source {manifest['commit']} ({manifest['digest']})")
             return 0
         if args.command == "prepare":
             measurement = json.loads(args.measurement_manifest.read_text()) if args.measurement_manifest else None
-            manifest = prepare_manifest(args.checkout_root, measurement, expected_commit=args.commit)
+            manifest = prepare_manifest(args.checkout_root, args.commit, measurement_manifest=measurement)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
             print(f"Prepared source revision {manifest['commit']} ({len(manifest['files'])} Python files)")

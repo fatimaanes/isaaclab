@@ -18,6 +18,8 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from . import source_revision
+
 LAUNCHER = Path(__file__).with_name("source_revision.py")
 TASK = Path("source/isaaclab_tasks/isaaclab_tasks/fixture_task.py")
 IMPORT_MAP = TASK.with_name("__init__.pyi")
@@ -177,6 +179,7 @@ class SourceRevisionTests(unittest.TestCase):
         return result
 
     def test_source_verification_workflow(self):
+        self.assertEqual(source_revision.prepare_manifest(self.checkout, self.commit_a)["commit"], self.commit_a)
         manifest_a, _ = self._prepare("manifest-a", "--commit", self.commit_a)
         with self.subTest(case="cached package origin is rejected"):
             output, sidecar = self._run(manifest_a, "stale", success=False, roots=[self.cached, self.checkout])
@@ -287,6 +290,36 @@ class SourceRevisionTests(unittest.TestCase):
             _, proof = self._run(manifest, "fresh-bytecode", success=False)
             self.assertEqual(proof["outputs"], [])
             self.assertTrue(any("produced no runtime JSON output" in item["reason"] for item in proof["mismatches"]))
+
+    def test_resolve_actual_merge_parent_in_a_shallow_checkout(self):
+        self._git("checkout", "--quiet", "-b", "pr")
+        self._task("B")
+        head = self._commit()
+        self._git("checkout", "--quiet", "-b", "base", self.commit_a)
+        self._write("base.txt", "Base moved after the PR event was created.\n")
+        base = self._commit()
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            "Fixture merge",
+            head,
+        )
+        merge = self._git("rev-parse", "HEAD")
+        # A depth-one checkout still contains the parent headers in the commit object.
+        (self.checkout / ".git/shallow").write_text(merge + "\n")
+        result = self._invoke("resolve-base", "--commit", merge, "--head-commit", head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), base)
+        for tested, requested in ((base, head), (merge, self.commit_a)):
+            with self.subTest(tested=tested, requested=requested):
+                result = self._invoke("resolve-base", "--commit", tested, "--head-commit", requested)
+                self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

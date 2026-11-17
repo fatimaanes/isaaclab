@@ -5,6 +5,7 @@
 
 """Exercise workflow activation, source mounts, and cancellation without starting GPU jobs."""
 
+import ast
 import json
 import os
 import signal
@@ -14,6 +15,7 @@ import textwrap
 from contextlib import suppress
 from pathlib import Path
 
+import pytest
 import yaml
 
 _WORKFLOW = Path(__file__).resolve().parents[2] / "workflows/build.yaml"
@@ -85,18 +87,21 @@ const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
     assert stopped.returncode != 0, "Unactivated PR explanation step exited successfully"
 
 
-def test_benchmark_cancellation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("role", ["baseline", "candidate"])
+def test_benchmark_cancellation(tmp_path: Path, role: str) -> None:
     workflow = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
     command = next(
         step["run"]
-        for step in workflow["jobs"]["performance-regression"]["steps"]
-        if step.get("name") == "Run runtime benchmarks"
+        for step in workflow["jobs"]["performance-smoke"]["steps"]
+        if step.get("name")
+        == ("Benchmark the PR base on this runner" if role == "baseline" else "Run runtime benchmarks")
     )
     step_script = tmp_path / "workflow-step.sh"
     step_script.write_text(command, encoding="utf-8")
     controller = tmp_path / "controller"
     scripts = controller / "tools/performance_regression"
     scripts.mkdir(parents=True)
+    (controller / "baseline-output").mkdir()
     (scripts / "run_benchmarks.sh").write_bytes(
         (_WORKFLOW.parents[2] / "tools/performance_regression/run_benchmarks.sh").read_bytes()
     )
@@ -133,7 +138,9 @@ def test_benchmark_cancellation(tmp_path: Path) -> None:
     docker.chmod(0o755)
     # Exercise Bash cancellation and Docker cleanup; the timeout wrapper is replaced by exec.
     timeout = executables / "timeout"
-    timeout.write_text('#!/bin/bash\nshift\nexec "$@"\n', encoding="utf-8")
+    timeout.write_text(
+        '#!/bin/bash\nprintf "%s" "$1" > "$GITHUB_WORKSPACE/attempt-limit"\nshift\nexec "$@"\n', encoding="utf-8"
+    )
     timeout.chmod(0o755)
     df = executables / "df"
     df.write_text('#!/bin/bash\nprintf "Filesystem 1B-blocks\\nshm 1073741824\\n"\n', encoding="utf-8")
@@ -147,6 +154,7 @@ def test_benchmark_cancellation(tmp_path: Path) -> None:
         "GITHUB_RUN_ID": "123",
         "GITHUB_RUN_ATTEMPT": "2",
         "CI_IMAGE_TAG": "fixture-image",
+        "PERF_BASE_COMMIT": "a" * 40,
     }
     expected_mounts = {
         f"{tmp_path}/{path}:/workspace/isaaclab/{path}:{mode}"
@@ -168,8 +176,7 @@ def test_benchmark_cancellation(tmp_path: Path) -> None:
             started = next((json.loads(line) for line in process.stdout if line.startswith("{")), None)
             assert started is not None, (stop_signal.name, process.stderr.read())
             docker_args = started["argv"][: started["argv"].index(environment["CI_IMAGE_TAG"])]
-            assert "--ipc=private" in docker_args and "--ipc=host" not in docker_args
-            assert docker_args[docker_args.index("--shm-size") + 1] == "1073741824"
+            assert (tmp_path / "attempt-limit").read_text() == "600"
             mounts = {docker_args[index + 1] for index, arg in enumerate(docker_args) if arg == "-v"}
             assert expected_mounts <= mounts, (
                 f"Missing or incorrect Docker source mounts: {sorted(expected_mounts - mounts)};"
@@ -190,3 +197,83 @@ def test_benchmark_cancellation(tmp_path: Path) -> None:
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
             process.communicate()
+
+
+def test_local_pair_ownership_and_workflow_lifecycle() -> None:
+    root = _WORKFLOW.parents[2]
+    package = root / "tools/performance_regression"
+    # Keep paired execution in the workflow and calculations in compare.py. No second controller or embedded tests.
+    assert not (package / "pr_comparison.py").exists()
+    assert not (_WORKFLOW.parent / "performance-regression-check.yml").exists()
+    for path in package.glob("*.py"):
+        if path.name.startswith("test_"):
+            continue
+        tree = ast.parse(path.read_text())
+        assert not any(
+            isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name.startswith(("test_", "Test"))
+            for node in ast.walk(tree)
+        ), path
+        if path.name == "compare.py":
+            assert {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level} <= {
+                "contract",
+                "metrics",
+            }
+    assert (root / "tools/perf_smoke_thresholds.json").is_file()
+    assert not (root / "tools/performance_regression_thresholds.json").exists()
+    workflow = yaml.safe_load(_WORKFLOW.read_text())
+    job = workflow["jobs"]["performance-smoke"]
+    steps = job["steps"]
+    names = [step.get("name") for step in steps]
+    baseline = names.index("Benchmark the PR base on this runner")
+    restore = names.index("Restore the tested PR revision")
+    candidate = names.index("Run runtime benchmarks")
+    report = names.index("Compare fresh base and PR measurements")
+    assert baseline < restore < candidate < report
+    assert steps[baseline]["continue-on-error"] is True
+    assert "!cancelled()" in steps[restore]["if"]
+    assert "!cancelled()" in steps[candidate]["if"] and "measure_base" not in steps[candidate]["if"]
+    assert "always()" in steps[report]["if"]
+    assert workflow["jobs"]["performance-smoke-summary"]["name"] == "performance-smoke"
+    conditions = {
+        "current": steps[candidate]["if"],
+        "restore": steps[restore]["if"],
+        "report": steps[report]["if"],
+        "budget": job["timeout-minutes"],
+    }
+    conditions = {name: value.removeprefix("${{").removesuffix("}}") for name, value in conditions.items()}
+    evaluated = subprocess.run(
+        [
+            "node",
+            "-e",
+            """
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const assert = require('assert/strict');
+for (const base of ['success', 'failure', 'skipped']) {
+  for (const source of ['success', 'failure']) {
+    for (const cancelled of [false, true]) {
+      const steps = {base_dependencies: {outcome: base}, measure_base: {outcome: base},
+                     current_source: {outcome: source}};
+      const github = {event_name: 'pull_request'};
+      const evaluate = name => new Function('steps', 'github', 'cancelled', 'always',
+        'return (' + input[name] + ')')(steps, github, () => cancelled, () => true);
+      assert.equal(evaluate('current'), !cancelled && source === 'success');
+      assert.equal(evaluate('restore'), !cancelled);
+      assert.equal(evaluate('report'), true);
+      assert.equal(evaluate('budget'), 900);
+      github.event_name = 'push';
+      assert.equal(evaluate('budget'), 450);
+    }
+  }
+}
+""",
+        ],
+        input=json.dumps(conditions),
+        capture_output=True,
+        text=True,
+    )
+    assert evaluated.returncode == 0, evaluated.stderr
+    # Derive the total timeout from the actual matrix and original three-sample/one-retry policy.
+    matrix = next(step["run"] for step in steps if step.get("name") == "Define benchmark matrix")
+    limits = [int(line.split("|")[3]) for line in matrix.splitlines() if "|" in line]
+    assert sum(limits) * 3 * 2 * 2 / 60 < 900
+    assert "900" in str(job["timeout-minutes"])

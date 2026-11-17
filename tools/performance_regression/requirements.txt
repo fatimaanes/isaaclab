@@ -1,4 +1,4 @@
-# Host-only dependencies of the performance-regression gate.
+# Host-only dependencies of the perf-smoke gate.
 #
 # The gate runs on the CI *runner host*, outside the Isaac Sim container, so these are
 # installed into a throwaway virtualenv by the workflow rather than into the image or

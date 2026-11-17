@@ -19,8 +19,8 @@ from dataclasses import asdict, dataclass, field, replace
 from math import comb
 from typing import Any
 
-from .contract import Contract, backend_key, valid_backend_keys
-from .metrics import METRICS, Metric, PerformanceRegressionError, mapping, number
+from .contract import Contract, backend_key, build, normalize_gpu_model, valid_backend_keys
+from .metrics import METRICS, Metric, PerfSmokeError, mapping, nested_number, number, positive_int
 
 PASS = "PASS"
 WARN = "WARN"
@@ -38,6 +38,87 @@ MIN_BASELINE_SAMPLES = 3
 MAX_BASELINE_SAMPLES = 20
 
 _SEVERITY = {PASS: 0, SKIP: 0, ERROR: 0, WARN: 1, FAIL: 2}
+
+
+def compare_pair(baseline: list[dict], candidate: list[dict], *, issues: list[str] | None = None) -> dict:
+    """Describe two fresh builds without applying the rolling-history gate's policy.
+
+    Source evidence is verified before entry. Workload, hardware, and measurement
+    protocol must match; dependency-version changes are reported as context.
+    """
+    reasons = list(issues or [])
+    selections = {}
+    identities = []
+    contexts = {}
+    for role, bundles in (("baseline", baseline), ("candidate", candidate)):
+        values, versions = [], []
+        if len(bundles) != 3:
+            reasons.append(f"{role}: expected three independent samples, found {len(bundles)}.")
+        for bundle in bundles:
+            try:
+                contract = build(bundle)
+                run, runtime = bundle["run"], mapping(bundle.get("runtime"), "runtime")
+                if run.get("status") != "completed":
+                    raise PerfSmokeError("runtime sample did not complete")
+                fps = nested_number(bundle, ("runtime", "total_fps", "mean"))
+                if fps is None or fps < 0:
+                    raise PerfSmokeError("FPS must be finite and nonnegative")
+                timing = mapping(runtime.get("environment_step_timing"), "environment_step_timing")
+                protocol = {
+                    "seed": run.get("seed"),
+                    "measured_steps": runtime.get("iterations_completed"),
+                    "steps_per_iteration": runtime.get("steps_per_iteration"),
+                    "warmup_steps": timing.get("warmup_steps"),
+                    "measurement_mode": timing.get("measurement_mode"),
+                }
+                if any(value is None for value in protocol.values()):
+                    raise PerfSmokeError("measurement protocol is incomplete")
+                hardware = bundle["hardware"]
+                models = [normalize_gpu_model(mapping(device, "GPU").get("name")) for device in hardware["gpu_devices"]]
+                if "unknown-gpu" in models or "unknown" in models or hardware["cpu_name"].lower() == "unknown":
+                    raise PerfSmokeError("CPU/GPU hardware identity is unknown")
+                identity = {
+                    "workload": contract.workload,
+                    "hardware": {
+                        "cpu_name": hardware["cpu_name"].strip().casefold(),
+                        "cpu_count": positive_int(hardware.get("cpu_count"), "hardware.cpu_count"),
+                        "gpu_devices": models,
+                    },
+                    "protocol": protocol,
+                }
+                identities.append(identity)
+                versions.append(contract.runtime["versions"])
+                values.append(fps)
+            except (PerfSmokeError, KeyError, TypeError) as exc:
+                reasons.append(f"{role}: {exc}")
+        if versions and any(value != versions[0] for value in versions[1:]):
+            reasons.append(f"{role}: dependency versions vary between samples.")
+        contexts[role] = versions[0] if versions else {}
+        selections[role] = {
+            "samples": values,
+            "count": len(values),
+            "median": statistics.median(values) if values else None,
+        }
+    if identities:
+        for field in ("workload", "hardware", "protocol"):
+            if any(identity[field] != identities[0][field] for identity in identities[1:]):
+                reasons.append(f"{field.capitalize()} differs between samples or builds.")
+    change = None
+    if not reasons:
+        before, after = selections["baseline"]["median"], selections["candidate"]["median"]
+        if before:
+            try:
+                change = number(100 * (after / before - 1), "FPS change")
+            except PerfSmokeError as exc:
+                reasons.append(str(exc))
+    return {
+        **selections,
+        "status": "not_comparable" if reasons else "compared",
+        "change_pct": change,
+        "reasons": list(dict.fromkeys(reasons)),
+        "versions": contexts,
+        "context_changed": contexts["baseline"] != contexts["candidate"],
+    }
 
 
 @dataclass(frozen=True)
@@ -88,7 +169,7 @@ class Report:
 
 def _warn(message: str) -> None:
     """Report a policy problem that must not stop the comparison."""
-    print(f"::warning::performance-regression: {message}", file=sys.stderr)
+    print(f"::warning::perf-smoke: {message}", file=sys.stderr)
 
 
 def _clean(config: Any, name: str) -> dict[str, Any]:
@@ -100,7 +181,7 @@ def resolve_thresholds(config: Any, gpu_model: str, task: str, key: str) -> dict
     """Resolve gating policy for every metric of one combination.
 
     Args:
-        config: Parsed ``performance_regression_thresholds.json``.
+        config: Parsed ``perf_smoke_thresholds.json``.
         gpu_model: Canonical GPU slug (see :func:`~tools.performance_regression.contract.normalize_gpu_model`).
         task: Gym task id.
         key: ``{physics}`` or ``{physics}_{render}``.
@@ -109,7 +190,7 @@ def resolve_thresholds(config: Any, gpu_model: str, task: str, key: str) -> dict
         Mapping of metric name to its resolved :class:`Thresholds`.
 
     Raises:
-        PerformanceRegressionError: If the config is malformed.
+        PerfSmokeError: If the config is malformed.
     """
     root = _clean(config, "threshold config")
     defaults = _clean(root.get("defaults", {}), "threshold config defaults")
@@ -123,10 +204,10 @@ def resolve_thresholds(config: Any, gpu_model: str, task: str, key: str) -> dict
     if "fail_regression_pct" in override:
         fail = number(override["fail_regression_pct"], f"per_task_regression_pct.{task}.fail_regression_pct")
     if not 0 <= warn <= fail < 100:
-        raise PerformanceRegressionError(f"regression percentages must satisfy 0 <= warn <= fail < 100 for {task}")
+        raise PerfSmokeError(f"regression percentages must satisfy 0 <= warn <= fail < 100 for {task}")
     advisory_only = override.get("advisory_only", False)
     if not isinstance(advisory_only, bool):
-        raise PerformanceRegressionError(f"per_task_regression_pct.{task}.advisory_only must be a boolean")
+        raise PerfSmokeError(f"per_task_regression_pct.{task}.advisory_only must be a boolean")
 
     floors = _clean(root.get("hard_floor_fps", {}), "hard_floor_fps")
     by_task = _clean(floors.get(gpu_model, {}), f"hard_floor_fps.{gpu_model}")
@@ -220,9 +301,7 @@ def _evaluate(
         from asv._stats import mann_whitney_u
         from asv_runner.statistics import compute_stats
     except ImportError as exc:
-        raise PerformanceRegressionError(
-            "ASV is unavailable; install tools/performance_regression/requirements.txt"
-        ) from exc
+        raise PerfSmokeError("ASV is unavailable; install tools/performance_regression/requirements.txt") from exc
 
     # ASV assumes lower is better. Reversing FPS comparisons preserves the
     # original samples and medians, including zero throughput and even counts.
@@ -312,7 +391,7 @@ def compare(
         contract: Comparability contract for this run.
         measurements: Metric mappings from independent candidate runs.
         history: Metric mappings from prior comparable runs, oldest first.
-        threshold_config: Parsed ``performance_regression_thresholds.json``.
+        threshold_config: Parsed ``perf_smoke_thresholds.json``.
         min_samples: Comparable runs required before a verdict is rendered.
         label: Matrix combination name.
 
@@ -322,9 +401,9 @@ def compare(
         metrics are evaluated and reported, but never change the verdict.
     """
     if not measurements:
-        raise PerformanceRegressionError("at least one candidate run is required")
+        raise PerfSmokeError("at least one candidate run is required")
     if min_samples < 2:
-        raise PerformanceRegressionError("min_samples must be at least 2 for ASV significance testing")
+        raise PerfSmokeError("min_samples must be at least 2 for ASV significance testing")
     thresholds = resolve_thresholds(
         threshold_config,
         str(contract.runtime.get("gpu_model", "")),
